@@ -69,6 +69,7 @@ dependencies = [
  "env_logger",
  "log",
  "nom",
+ "regex",
 ]
 
 [[package]]
