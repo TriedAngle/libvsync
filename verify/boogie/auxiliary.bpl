@@ -33,7 +33,8 @@ type StateIndex = int;
 
 
 datatype Effect {
-    read(addr: int, value: int),
+    // read(a,v,vis) == read at a the value v. vis means whether this read is visible to barriers
+    read(addr: int, value: int, visible: bool),
     write(addr: int, value: int)
 }
 var last_load, last_store: StateIndex;
@@ -150,7 +151,7 @@ axiom order_rel_sc == (lambda store, entry, exit: StateIndex, ordering: [StateIn
 const order_fence_acq: OrderRelation;
 axiom order_fence_acq == (lambda fence, entry, exit: StateIndex, ordering: [StateIndex][Ordering] bool, effects: [StateIndex][Effect] bool ::
         (forall i, j: StateIndex ::
-            (i < entry) && (j >= exit) && (exists e: Effect :: effects[i][e] && e is read) && (exists e: Effect :: effects[j][e])
+            (i < entry) && (j >= exit) && (exists e: Effect :: effects[i][e] && e is read && e->visible) && (exists e: Effect :: effects[j][e])
                 ==> ppo(i, j, ordering, effects))
 );
 
@@ -169,8 +170,6 @@ axiom order_fence_sc == (lambda fence, entry, exit: StateIndex, ordering: [State
 
 
 
-
-
 function no_writes(from, to, write: StateIndex): bool {
     (write < from || to <= write)
 }
@@ -179,10 +178,11 @@ function no_writes(from, to, write: StateIndex): bool {
 
 type RMWOp = [int, int, int] int;
 
-const cmpset, add_op, set_op, min_op, max_op, ret_old: RMWOp;
+const cmpset, add_op, sub_op, set_op, min_op, max_op, ret_old: RMWOp;
 
 axiom cmpset == (lambda x, y1, y2 : int :: if x == y1 then y2 else x);
 axiom add_op == (lambda x, y, _: int :: x + y);
+axiom sub_op == (lambda x, y, _: int :: x - y);
 axiom set_op == (lambda x, y, _: int :: y);
 axiom min_op == (lambda x, y, _: int :: if x < y then x else y);
 axiom max_op == (lambda x, y, _: int :: if x < y then y else x);

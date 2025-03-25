@@ -3,3 +3,5 @@ read_acq
 read_rlx
 write
 cmpxchg
+fence
+fence_acq
