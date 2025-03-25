@@ -1,7 +1,5 @@
 use asm2boogie::{
-    arm::{extract_arm_functions, parse_arm_assembly, remove_directives, transform_labels},
-    generate_boogie_file, generate_debug_file,
-    riscv::{ parse_riscv_assembly}
+    arm::{extract_arm_functions, parse_arm_assembly, remove_directives, transform_labels}, generate_boogie_file, generate_debug_file, riscv::parse_riscv_assembly, wide_arch_widths, Width
 };
 
 use clap::{Parser, ValueEnum};
@@ -67,6 +65,7 @@ fn ensure_directory_exists(path: &str) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let args = Args::parse();
@@ -116,6 +115,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     log::info!("Successfully read input file '{}'", args.input);
 
+    let width_map = match args.arch {
+        Arch::ArmV8 => wide_arch_widths,  
+        Arch::RiscV => wide_arch_widths,
+    };
+
     let processed_functions = match args.arch {
         Arch::ArmV8 => {
             let parsed = match parse_arm_assembly(&input_content) {
@@ -127,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             log::info!("Successfully parsed arm assembly");
 
-            let processed_functions = extract_arm_functions(parsed, Some(&function_names), &["64", ""])
+            let processed_functions = extract_arm_functions(parsed, Some(&function_names), &["ptr", "32", "64", ""])
                 .into_iter()
                 .map(|f| transform_labels(&f))
                 .map(|f| remove_directives(&f))
@@ -160,7 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             for function in &processed_functions {
                 log::info!("Generating Boogie code for function: {}", function.name);
-                generate_boogie_file(function, &dir_path, template_dir)?;
+                generate_boogie_file(function, &dir_path, template_dir, width_map)?;
             }
         }
     }
