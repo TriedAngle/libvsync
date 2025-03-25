@@ -1,5 +1,5 @@
 use asm2boogie::{
-    arm::{extract_arm_functions, parse_arm_assembly, remove_directives, transform_labels}, generate_boogie_file, generate_debug_file, riscv::parse_riscv_assembly, wide_arch_widths, Width
+    arm::{extract_arm_functions, parse_arm_assembly, remove_directives, transform_labels}, generate_boogie_file, generate_debug_file, riscv::parse_riscv_assembly, wide_arch_widths
 };
 
 use clap::{Parser, ValueEnum};
@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             log::info!("Successfully parsed arm assembly");
 
-            let processed_functions = extract_arm_functions(parsed, Some(&function_names), &["ptr", "32", "64", ""])
+            let processed_functions = extract_arm_functions(parsed, Some(&function_names), &["ptr", "32", "64", "sz", "8", ""])
                 .into_iter()
                 .map(|f| transform_labels(&f))
                 .map(|f| remove_directives(&f))
