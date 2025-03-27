@@ -1,4 +1,4 @@
-use std::{fs, io::Write, path::Path};
+use std::{collections::{HashMap, HashSet}, fs, io::Write, path::Path};
 use phf::phf_map;
 
 use arm::{ArmFunction, arm_to_boogie_code, get_used_registers};
@@ -21,11 +21,12 @@ pub enum UnifiedInstruction {
     Label(String),
     Instr(String, Vec<Operator>),
     Branch(String, String),
+    Jump(String),
 }
 
 
 #[derive(Debug, Clone, PartialEq, Copy)]
-pub enum RmwType {
+pub enum ReturnType {
     Return,
     NoReturn,
 }
@@ -34,9 +35,9 @@ pub enum RmwType {
 pub enum FunctionClass {
     Read,
     Write,
-    Await,
+    Await(ReturnType),
     AwaitRmw,
-    Rmw(RmwType),
+    Rmw(ReturnType),
     Fence,
 }
 
@@ -72,6 +73,7 @@ static RMW_OP: phf::Map<&'static str, &'static str> = phf_map! {
     "cmpxchg" => "cmpset",
     "add" => "add_op",
     "sub" => "sub_op",
+    "xchg" => "set_op",
     "set" => "set_op",
     "dec" => "dec_op",
     "inc" => "inc_op",
@@ -110,13 +112,13 @@ fn classify_function(name: &str) -> FunctionClass {
     } else if name.contains("await") {
         if RMW_RE.is_match(name) {
             FunctionClass::AwaitRmw
-        } else {
-            FunctionClass::Await
+        } else  {
+            FunctionClass::Await(if name.contains("eq") { ReturnType::NoReturn } else { ReturnType::Return })
         }
     } else if name.contains("fence") {
         FunctionClass::Fence
     } else {
-        let ret = if RETURNING_RMW.captures(name).is_some() { RmwType::Return } else { RmwType::NoReturn };
+        let ret = if RETURNING_RMW.captures(name).is_some() { ReturnType::Return } else { ReturnType::NoReturn };
         FunctionClass::Rmw(ret)
     }
 }
@@ -126,9 +128,10 @@ fn get_templates_for_type(func_type: FunctionClass) -> Vec<&'static str> {
     match func_type {
         FunctionClass::Read => vec!["read_only.bpl", "read.bpl"],
         FunctionClass::Write => vec!["write.bpl", "must_store.bpl"],
-        FunctionClass::Await => vec!["read_only.bpl", "read.bpl", "await.bpl"],
-        FunctionClass::Rmw(RmwType::NoReturn) => vec!["write.bpl", "rmw.bpl"],
-        FunctionClass::Rmw(RmwType::Return) => vec!["read.bpl", "write.bpl", "rmw.bpl"],
+        FunctionClass::Await(ReturnType::NoReturn) => vec!["await.bpl"],
+        FunctionClass::Await(ReturnType::Return) => vec!["read_only.bpl", "read.bpl", "await.bpl"],
+        FunctionClass::Rmw(ReturnType::NoReturn) => vec!["write.bpl", "rmw.bpl"],
+        FunctionClass::Rmw(ReturnType::Return) => vec!["read.bpl", "write.bpl", "rmw.bpl"],
         FunctionClass::AwaitRmw => vec!["read.bpl", "write.bpl", "rmw.bpl", "await.bpl"],
         FunctionClass::Fence => vec!["fence.bpl"],
     }
@@ -179,7 +182,6 @@ pub fn generate_boogie_file(
     template_dir: &str,
     type_map: fn(AtomicType) -> Width,
 ) -> Result<(), std::io::Error> {
-    
     let func_type = classify_function(&function.name);
     let templates = get_templates_for_type(func_type);
 
@@ -191,7 +193,6 @@ pub fn generate_boogie_file(
     let atomic_type = WIDTH_RE.captures(&function.name).map(|c| ATOMIC_TYPE[&c[0]]).unwrap_or(AtomicType::VFENCE);
     let type_width = type_map(atomic_type); 
 
-    println!("function {} type {:?} width {:?}", function.name, atomic_type, &type_width);
     let address = "x0";
     let output = match type_width { Width::Thin => "w0", _ => "x0" };
     let input1 = match type_width { Width::Thin => "w1", _ => "x1" };
@@ -207,7 +208,8 @@ pub fn generate_boogie_file(
         if let Some(op) = RMW_OP.get(rmw_name.name("type").unwrap().as_str()) {
             rmw_op = op.to_string();
 
-            if rmw_name.name("get_").is_some() {
+            if rmw_name.name("_get").is_some() {
+
                 read_ret = op.to_string();
             }
         }
@@ -263,6 +265,7 @@ pub fn generate_boogie_file(
 
     }
 
+    println!("generated verification templates for function {} ({:?})", function.name, atomic_type);
     Ok(())
 }
 
@@ -279,4 +282,53 @@ pub fn generate_debug_file(code: &[ArmFunction], path: &str) -> Result<(), std::
         writeln!(file, "{:#?}", content)?;
     }
     Ok(())
+}
+
+
+use petgraph::{graphmap, Directed};
+pub fn loop_headers(code: &[UnifiedInstruction]) -> HashSet<usize> {
+    let mut graph = graphmap::GraphMap::<_, _, Directed>::with_capacity(code.len() + 1, 2*code.len() + 1);
+    let label_idx : HashMap<_,_> = code.iter().enumerate().filter_map(|(i,instr)| 
+        match instr {
+            UnifiedInstruction::Label(name) => Some((name, i)),
+            _ => None,
+        }
+    ).collect();
+
+
+    for (i, instr) in code.iter().enumerate() {
+        match &instr {
+            UnifiedInstruction::Jump(target) => {
+                graph.add_edge(i,  label_idx[target], ());
+            },
+            UnifiedInstruction::Branch(_, target) => {
+                graph.add_edge(i,  label_idx[target], ());
+                graph.add_edge(i, i+1, ());
+            },
+            _ => {
+                graph.add_edge(i, i+1, ());
+            }
+        }
+    }
+
+    let scc = petgraph::algo::tarjan_scc(&graph);
+
+    let mut loop_entries = HashSet::new();
+
+    for component in scc {
+        let set : HashSet<_> = component.iter().copied().collect();
+        for i in set.iter().copied() {
+            let mut in_loop = false;
+            let mut entry = false; 
+            for n in graph.neighbors_directed(i, petgraph::Direction::Incoming) {
+                if set.contains(&n) { in_loop = true; }
+                else { entry = true; }
+            }
+            if in_loop && entry {
+                loop_entries.insert(i);
+            }
+        }
+    }
+
+    loop_entries
 }
