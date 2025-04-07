@@ -1,13 +1,9 @@
-use generate::{boogie_to_string, get_used_registers};
+use generate::boogie_to_string;
 use phf::phf_map;
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    io::Write,
-    path::Path,
+    collections::{HashMap, HashSet}, fs, hash::BuildHasher, io::Write, path::Path
 };
 
-use clap::ValueEnum;
 use lazy_static::lazy_static;
 use regex::Regex;
 
@@ -16,48 +12,33 @@ pub mod generate;
 pub mod riscv;
 pub const DUMMY_REG: &str = "dummy";
 
-#[derive(ValueEnum, Debug, Clone, Copy)]
-pub enum Arch {
-    RiscV,
-    ArmV8,
+pub struct AssemblyFunction<'a> {
+    pub name: &'a str,
+    pub code: Vec<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Operand {
-    Immediate(String),
-    Address(String),
-    AdressOffset(String, i64),
-    Label(String),
-    Register(String),
-    Bool(bool),
-    Value(i64),
-    Named(String),
-    Cond(Condition),
+pub enum FenceConvention {
+    RCsc,
+    TrailingFence,
+    LeadingFence,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Condition {
-    EQ,
-    NE,
-    HS,
-    LO,
-    HI,
-    LS,
-
-    // ARM
-    BZ,
-    BNZ,
-
-    // Risc
-    NEZ,
+pub trait Arch {
+    fn name(&self) -> String;
+    fn all_registers(&self) -> Vec<String>;
+    fn width(&self) -> Width;
+    fn parse_functions(&self, assembly: &str) -> Result<Vec<BoogieFunction>, Box<dyn std::error::Error>>;
+    fn state(&self) -> String;
+    fn fence_convention(&self) -> FenceConvention;
 }
+
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoogieInstruction {
     Label(String),
-    Instr(String, String, Vec<Operand>),
-    ArmBranch(Condition, Operand, String),
-    RiscvBranch(Condition, Operand, Operand, String),
+    Instr(String, String, Vec<String>),
+    Branch(String, String),
     Jump(String),
     Unhandled(String),
     Return,
@@ -173,13 +154,72 @@ fn get_templates_for_type(func_type: FunctionClass) -> Vec<&'static str> {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct BoogieFunction {
     pub name: String,
+    pub address: String,
+    pub input1: String,
+    pub input2: String,
+    pub output: String,
     pub instructions: Vec<BoogieInstruction>,
 }
 
 pub trait ToBoogie {
     fn to_boogie(self) -> BoogieFunction;
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Width {
+    Thin,
+    Wide,
+}
+
+pub fn wide_arch_widths(type_name: AtomicType) -> u32 {
+    match type_name {
+        AtomicType::V8 => 1,
+        AtomicType::V16 => 2,
+        AtomicType::V32 => 4,
+        _ => 8,
+    }
+}
+
+pub fn thin_arch_widths(type_name: AtomicType) -> u32 {
+    match type_name {
+
+        AtomicType::V8 => 1,
+        AtomicType::V16 => 2,
+        AtomicType::VSZ | AtomicType::VPTR | AtomicType::V32 => 4,
+        _ => 8,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AtomicType {
+    V64,
+    VSZ,
+    VPTR,
+    V32,
+    V16,
+    V8,
+    VFENCE,
+}
+
+
+pub fn atomic_types(function_name: &str) -> AtomicType {
+    WIDTH_RE
+        .captures(function_name)
+        .map(|c| ATOMIC_TYPE[&c[0]])
+        .unwrap_or(AtomicType::VFENCE)
+}
+
+impl AtomicType {
+    pub fn type_width(&self, arch_width: Width) -> u32 {
+        match arch_width {
+            Width::Thin => thin_arch_widths(*self),
+            Width::Wide => wide_arch_widths(*self),
+        }
+    }
 }
 
 fn get_assumptions(
@@ -204,72 +244,24 @@ fn get_assumptions(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Width {
-    Thin,
-    Wide,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AtomicType {
-    V64,
-    VSZ,
-    VPTR,
-    V32,
-    V16,
-    V8,
-    VFENCE,
-}
-
-pub fn wide_arch_widths(type_name: AtomicType) -> Width {
-    match type_name {
-        AtomicType::V32 | AtomicType::V8 => Width::Thin,
-        _ => Width::Wide,
-    }
-}
-
-pub fn thin_arch_widths(type_name: AtomicType) -> Width {
-    match type_name {
-        AtomicType::V32 | AtomicType::V8 | AtomicType::VSZ | AtomicType::VPTR => Width::Thin,
-        _ => Width::Wide,
-    }
-}
 
 pub fn generate_boogie_file(
     function: &BoogieFunction,
     output_dir: &str,
     template_dir: &str,
-    arch: Arch,
-    type_map: fn(AtomicType) -> Width,
+    arch: &dyn Arch
 ) -> Result<(), std::io::Error> {
     let func_type = classify_function(&function.name);
     let templates = get_templates_for_type(func_type);
 
     let boogie_code = boogie_to_string(&function.instructions);
 
-    let registers = get_used_registers(&function.instructions);
+    let registers = arch.all_registers();
 
-    let state = "local_monitor, monitor_exclusive, flags, event_register";
+    let state = arch.state();
 
-    let atomic_type = WIDTH_RE
-        .captures(&function.name)
-        .map(|c| ATOMIC_TYPE[&c[0]])
-        .unwrap_or(AtomicType::VFENCE);
-    let type_width = type_map(atomic_type);
+    let atomic_type = atomic_types(&function.name);
 
-    let address = "x0";
-    let output = match type_width {
-        Width::Thin => "w0",
-        _ => "x0",
-    };
-    let input1 = match type_width {
-        Width::Thin => "w1",
-        _ => "x1",
-    };
-    let input2 = match type_width {
-        Width::Thin => "w2",
-        _ => "x2",
-    };
 
     let target_path = Path::new(output_dir).join(&function.name);
     fs::create_dir_all(&target_path)?;
@@ -283,6 +275,10 @@ pub fn generate_boogie_file(
             if rmw_name.name("_get").is_some() {
                 read_ret = op.to_string();
             }
+        }
+
+        if func_type == FunctionClass::AwaitRmw {
+            rmw_op = format!("(lambda x, y1, y2: int :: {}[x, y2, y1])", rmw_op);
         }
     }
 
@@ -314,12 +310,28 @@ pub fn generate_boogie_file(
         _ => {}
     }
 
+    let pointer_size = 2u64.wrapping_pow(8*AtomicType::VPTR.type_width(arch.width())).wrapping_sub(1);
+    let register_size = 2u64.wrapping_pow(8*atomic_type.type_width(arch.width())).wrapping_sub(1);
+
     for template in templates {
         let template_path = Path::new(template_dir).join(template);
         let template_content = fs::read_to_string(&template_path)?;
 
         let boogie_code_with_assume = format!(
-            "    assume (last_store < step);\n{}\n{}",
+            "
+    assume (last_store < step);
+    assume (sc_impl is {:?});
+    assume (valid_mask({}, {}));
+    assume (valid_mask({}, {}));
+    assume (valid_mask({}, {}));
+    assume (valid_mask({}, {}));
+    {}
+    {}",
+            arch.fence_convention(),
+            function.address, pointer_size,
+            function.input1, register_size,
+            function.input2, register_size,
+            function.output, register_size,
             get_assumptions(
                 template,
                 load_order,
@@ -333,12 +345,12 @@ pub fn generate_boogie_file(
 
         let content = template_content
             .replace("    #implementation", &boogie_code_with_assume)
-            .replace("#registers", &registers)
-            .replace("#address", address)
-            .replace("#state", state)
-            .replace("#output", output)
-            .replace("#input1", input1)
-            .replace("#input2", input2);
+            .replace("#registers", registers.join(",").as_str())
+            .replace("#address", &function.address)
+            .replace("#state", &state)
+            .replace("#output", &function.output)
+            .replace("#input1", &function.input1)
+            .replace("#input2", &function.input2);
 
         fs::write(&target_path.join(template), content)?;
     }
@@ -355,18 +367,96 @@ pub fn generate_debug_file(boogie: &[BoogieFunction], path: &str) -> Result<(), 
     for function in boogie {
         let boogie_code = boogie_to_string(&function.instructions);
 
-        let registers = get_used_registers(&function.instructions);
-
         let content = format!(
-            "// ---- {} ----\n{}\n{}\n",
-            function.name, registers, boogie_code
+            "// ---- {} ----\n{}\n",
+            function.name, boogie_code
         );
         writeln!(file, "{:#?}", content)?;
     }
     Ok(())
 }
 
-use petgraph::{Directed, graphmap};
+use petgraph::{graphmap::{self, NodeTrait}, prelude::GraphMap, visit::{EdgeRef, GraphBase, IntoEdgeReferences, IntoEdgesDirected, IntoNeighbors, IntoNeighborsDirected, IntoNodeIdentifiers, NodeIndexable}, Directed, EdgeType};
+
+trait RemoveEdge : GraphBase
+{
+    fn remove_edge(&mut self, to_remove: <Self as GraphBase>::EdgeId);
+}
+
+
+impl <N : PartialEq + Copy + NodeTrait, E, Ty : EdgeType, S:BuildHasher> RemoveEdge for GraphMap<N, E, Ty, S> {
+    fn remove_edge(&mut self, to_remove: Self::EdgeId) {
+        self.remove_edge(to_remove.0, to_remove.1);
+    }
+}
+impl <N : PartialEq + Copy + NodeTrait, E, Ty : EdgeType, S:BuildHasher> IdConvertible for GraphMap<N, E, Ty, S> {
+    fn edge_from_ref(ref_value: <&Self as GraphBase>::EdgeId) -> <Self as GraphBase>::EdgeId {
+        ref_value
+    }
+    fn node_from_ref(ref_value: <&Self as GraphBase>::NodeId) -> <Self as GraphBase>::NodeId {
+        ref_value
+    }
+}
+
+
+trait IdConvertible 
+where Self : GraphBase + Sized {
+    fn edge_from_ref(ref_value: <&Self as GraphBase>::EdgeId) -> <Self as GraphBase>::EdgeId;
+    fn node_from_ref(ref_value: <&Self as GraphBase>::NodeId) -> <Self as GraphBase>::NodeId;
+}
+
+fn loop_headers_iter<G : RemoveEdge + IdConvertible>(cfg: &mut G, loop_entries: &mut HashSet<<G as GraphBase>::NodeId>)
+where for <'a> &'a G : IntoNeighborsDirected + IntoEdgesDirected + IntoNodeIdentifiers + IntoNeighbors + NodeIndexable + IntoEdgeReferences,
+ for <'a> <&'a G as GraphBase>::NodeId: Eq + std::hash::Hash + Copy,
+ <G as GraphBase>::NodeId: Eq + std::hash::Hash + Copy,
+ {
+    let scc = petgraph::algo::tarjan_scc(&*cfg);
+
+
+    for component in scc {
+        let set: HashSet<_> = component.iter().copied().collect();
+        for i in set.iter().copied() {
+            let mut in_loop = false;
+            let mut entry = false;
+            for edge in cfg.edges_directed(i, petgraph::Direction::Incoming) {
+                if set.contains(&edge.source()) {
+                    in_loop = true;
+                } else {
+                    entry = true;
+                }
+            }
+            if in_loop && entry {
+                loop_entries.insert(G::node_from_ref(i));
+            }
+        }
+    }
+ }
+
+
+fn loop_headers_rec<G : RemoveEdge + IdConvertible>(cfg: &mut G, loop_entries: &mut HashSet<<G as GraphBase>::NodeId>)
+where for <'a> &'a G : IntoNeighborsDirected + IntoEdgesDirected + IntoNodeIdentifiers + IntoNeighbors + NodeIndexable + IntoEdgeReferences,
+ for <'a> <&'a G as GraphBase>::NodeId: Eq + std::hash::Hash + Copy,
+ <G as GraphBase>::NodeId: Eq + std::hash::Hash + Copy,
+ {
+    loop {
+        loop_headers_iter(cfg, loop_entries);
+    
+        let edges = cfg.edge_references()
+            .filter(|e| loop_entries.contains(&G::node_from_ref(e.target())))
+            .map(|e| G::edge_from_ref(e.id()))
+            .collect::<Vec<_>>();
+        
+        if edges.is_empty() {
+            break;
+        }
+
+        for e in edges {
+            cfg.remove_edge(e);
+        }
+    }
+
+}
+
 pub fn loop_headers(code: &[BoogieInstruction]) -> HashSet<usize> {
     let mut graph =
         graphmap::GraphMap::<_, _, Directed>::with_capacity(code.len() + 1, 2 * code.len() + 1);
@@ -379,13 +469,16 @@ pub fn loop_headers(code: &[BoogieInstruction]) -> HashSet<usize> {
         })
         .collect();
 
+
     for (i, instr) in code.iter().enumerate() {
         match &instr {
+            BoogieInstruction::Return => {
+            }
             BoogieInstruction::Jump(target) => {
                 graph.add_edge(i, label_idx[target], ());
             }
-            BoogieInstruction::ArmBranch(_, _, target)
-            | BoogieInstruction::RiscvBranch(_, _, _, target) => {
+            BoogieInstruction::Branch(target, _)
+            => {
                 graph.add_edge(i, label_idx[target], ());
                 graph.add_edge(i, i + 1, ());
             }
@@ -395,27 +488,8 @@ pub fn loop_headers(code: &[BoogieInstruction]) -> HashSet<usize> {
         }
     }
 
-    let scc = petgraph::algo::tarjan_scc(&graph);
-
+    
     let mut loop_entries = HashSet::new();
-
-    for component in scc {
-        let set: HashSet<_> = component.iter().copied().collect();
-        for i in set.iter().copied() {
-            let mut in_loop = false;
-            let mut entry = false;
-            for n in graph.neighbors_directed(i, petgraph::Direction::Incoming) {
-                if set.contains(&n) {
-                    in_loop = true;
-                } else {
-                    entry = true;
-                }
-            }
-            if in_loop && entry {
-                loop_entries.insert(i);
-            }
-        }
-    }
-
+    loop_headers_rec(&mut graph, &mut loop_entries);
     loop_entries
 }

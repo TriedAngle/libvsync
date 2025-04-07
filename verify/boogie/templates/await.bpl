@@ -1,10 +1,10 @@
 var #registers: int;
 
 procedure await(cond : AwaitOp)
-    modifies step, atomic, last_load, last_store, #state, #registers;
+    modifies step, last_load, last_store, #state, #registers;
 
     ensures {:msg "satisfy await condition"}
-        cond[effects[last_load]->value, old(#input1)];
+        cond[effects[last_load]->read_value, old(#input1)];
 {
     #implementation
 }
