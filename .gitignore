@@ -2,4 +2,4 @@ doc.h
 build/
 *.ll
 .kakrc
-target/
+**/target
